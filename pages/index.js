@@ -1,7 +1,11 @@
+=== file: pages/index.js (updated) ===
 import React, { useState } from 'react';
-import { Search, Calendar, MapPin, Users, DollarSign, Phone, ExternalLink, Target } from 'lucide-react';
+import {
+  Search, Calendar, MapPin, Users, DollarSign, Phone, ExternalLink, Target, Tag, Clock
+} from 'lucide-react';
 
 export default function Home() {
+  const [mode, setMode] = useState('business'); // 'business' | 'public'
   const [isLoading, setIsLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [error, setError] = useState('');
@@ -32,108 +36,146 @@ export default function Home() {
     "Behind the Seal: Building Better Business -- Mastering Business Insurance"
   ];
 
-  const findOpportunities = async () => {
+  async function runSearch(which = mode) {
     const startTime = Date.now();
     setIsLoading(true);
     setError('');
     setSearchTime(null);
-    
+    setResults(null);
+
+    const endpoint = which === 'public' ? '/api/find-public-events' : '/api/find-opportunities';
+
     try {
-      const response = await fetch('/api/find-opportunities', {
+      const response = await fetch(endpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
+        // Body is currently unused by your API, but we send it for parity/future filters.
         body: JSON.stringify({
           serviceAreas,
           bbbTopics,
-          timeframe: '90 days'
+          timeframe: '90 days',
+          mode: which
         }),
       });
 
-      if (!response.ok) {
-        throw new Error('Failed to fetch opportunities');
-      }
+      if (!response.ok) throw new Error(`Failed to fetch ${which} opportunities`);
 
       const data = await response.json();
-      const endTime = Date.now();
-      const duration = Math.round((endTime - startTime) / 1000);
-      const minutes = Math.floor(duration / 60);
-      const seconds = duration % 60;
-      
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
       setResults(data);
-      setSearchTime({ minutes, seconds });
+      setSearchTime({ minutes: Math.floor(elapsed / 60), seconds: elapsed % 60 });
     } catch (err) {
+      console.error(err);
       setError('Unable to fetch opportunities at this time. Please try again later.');
-      console.error('Error:', err);
     } finally {
       setIsLoading(false);
     }
-  };
+  }
 
-  const EventCard = ({ event }) => (
-    <div className="bg-white border border-gray-200 rounded-lg p-6 shadow-sm hover:shadow-md transition-shadow">
-      <h3 className="text-xl font-semibold text-gray-900 mb-3" style={{ fontFamily: 'Arial, sans-serif' }}>
-        {event.name}
-      </h3>
-      
-      <div className="space-y-3">
-        <div className="flex items-center text-gray-700">
-          <Calendar className="w-4 h-4 mr-2 text-blue-600" />
-          <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.date || 'Date TBD'}</span>
+  const EventCard = ({ event }) => {
+    const hasTopic = Boolean(event.topic);
+    const locationFallback = event.location ||
+      [event.city, event.state].filter(Boolean).join(', ') || 'Location TBD';
+
+    return (
+      <div className="bg-white border border-gray-200 rounded-lg p-6 shadow-sm hover:shadow-md transition-shadow">
+        <div className="flex items-start justify-between mb-3">
+          <h3 className="text-xl font-semibold text-gray-900" style={{ fontFamily: 'Arial, sans-serif' }}>
+            {event.name}
+          </h3>
+          {hasTopic && (
+            <span className="ml-3 inline-flex items-center bg-purple-100 text-purple-800 px-2 py-1 rounded-full text-xs font-medium">
+              <Tag className="w-3 h-3 mr-1" />
+              {event.topic}
+            </span>
+          )}
         </div>
-        
-        <div className="flex items-center text-gray-700">
-          <MapPin className="w-4 h-4 mr-2 text-blue-600" />
-          <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.location || 'Location TBD'}</span>
-        </div>
-        
-        <div className="flex items-center text-gray-700">
-          <DollarSign className="w-4 h-4 mr-2 text-blue-600" />
-          <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.cost || 'Cost TBD'}</span>
-        </div>
-        
-        <div className="flex items-center text-gray-700">
-          <Users className="w-4 h-4 mr-2 text-blue-600" />
-          <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.audienceType || 'General Business Audience'}</span>
-        </div>
-        
-        {event.contactInfo && (
+
+        <div className="space-y-3">
           <div className="flex items-center text-gray-700">
-            <Phone className="w-4 h-4 mr-2 text-blue-600" />
-            <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.contactInfo}</span>
+            <Calendar className="w-4 h-4 mr-2 text-blue-600" />
+            <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.date || 'Date TBD'}</span>
           </div>
-        )}
-        
-        {event.link && (
+
+          {event.time && (
+            <div className="flex items-center text-gray-700">
+              <Clock className="w-4 h-4 mr-2 text-blue-600" />
+              <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.time}</span>
+            </div>
+          )}
+
           <div className="flex items-center text-gray-700">
-            <ExternalLink className="w-4 h-4 mr-2 text-blue-600" />
-            <a href={event.link} target="_blank" rel="noopener noreferrer" 
-               className="text-blue-600 hover:text-blue-800 underline"
-               style={{ fontFamily: 'Arial, sans-serif' }}>
-              Event Link
-            </a>
+            <MapPin className="w-4 h-4 mr-2 text-blue-600" />
+            <span style={{ fontFamily: 'Arial, sans-serif' }}>{locationFallback}</span>
           </div>
-        )}
-        
-        {event.whyBBBShouldBeThere && (
-          <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded">
-            <div className="flex items-start">
-              <Target className="w-4 h-4 mr-2 text-green-600 mt-0.5" />
-              <div>
-                <h4 className="font-medium text-green-800 mb-1" style={{ fontFamily: 'Arial, sans-serif' }}>
-                  Why BBB Should Be There:
-                </h4>
-                <p className="text-green-700 text-sm" style={{ fontFamily: 'Arial, sans-serif' }}>
-                  {event.whyBBBShouldBeThere}
-                </p>
+
+          {event.cost && (
+            <div className="flex items-center text-gray-700">
+              <DollarSign className="w-4 h-4 mr-2 text-blue-600" />
+              <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.cost}</span>
+            </div>
+          )}
+
+          {event.audienceType && (
+            <div className="flex items-center text-gray-700">
+              <Users className="w-4 h-4 mr-2 text-blue-600" />
+              <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.audienceType}</span>
+            </div>
+          )}
+
+          {event.contactInfo && (
+            <div className="flex items-center text-gray-700">
+              <Phone className="w-4 h-4 mr-2 text-blue-600" />
+              <span style={{ fontFamily: 'Arial, sans-serif' }}>{event.contactInfo}</span>
+            </div>
+          )}
+
+          {event.link && (
+            <div className="flex items-center text-gray-700">
+              <ExternalLink className="w-4 h-4 mr-2 text-blue-600" />
+              <a
+                href={event.link}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-800 underline"
+                style={{ fontFamily: 'Arial, sans-serif' }}
+              >
+                Event Link
+              </a>
+            </div>
+          )}
+
+          {event.whyBBBShouldBeThere && (
+            <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded">
+              <div className="flex items-start">
+                <Target className="w-4 h-4 mr-2 text-green-600 mt-0.5" />
+                <div>
+                  <h4 className="font-medium text-green-800 mb-1" style={{ fontFamily: 'Arial, sans-serif' }}>
+                    Why BBB Should Be There:
+                  </h4>
+                  <p className="text-green-700 text-sm" style={{ fontFamily: 'Arial, sans-serif' }}>
+                    {event.whyBBBShouldBeThere}
+                  </p>
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
+
+  const Title = mode === 'public' ? 'Public Engagement Opportunities' : 'Business Engagement Opportunities';
+  const Subtitle =
+    mode === 'public'
+      ? 'This will generate public-facing events (festivals, fairs, town days, library programs, etc.)'
+      : 'This will generate what business focus events are occurring';
+  const Subtitle2 =
+    mode === 'public'
+      ? 'in our service area in the next 90 days.'
+      : 'in our service area in the next 90 days.';
+
+  const buttonText = mode === 'public' ? 'Find Public Opportunities' : 'Find Business Opportunities';
 
   return (
     <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Arial, sans-serif' }}>
@@ -141,33 +183,47 @@ export default function Home() {
         {/* Header */}
         <div className="text-center mb-8">
           <div className="flex items-center justify-center mb-4">
-         <img 
-  src="/images/bbb-logo.png" 
-  alt="BBB Logo" 
-  className="w-16 h-16 mr-4"
-  style={{ fontFamily: 'Arial, sans-serif' }}
-/>
-  
+            <img
+              src="/images/bbb-logo.png"
+              alt="BBB Logo"
+              className="w-16 h-16 mr-4"
+              style={{ fontFamily: 'Arial, sans-serif' }}
+            />
             <h1 className="text-4xl font-bold text-gray-900" style={{ fontFamily: 'Arial, sans-serif' }}>
-              Business Engagement Opportunities
+              {Title}
             </h1>
           </div>
-          
+
+          {/* Mode toggle */}
+          <div className="flex justify-center mb-6">
+            <div className="inline-flex rounded-lg border border-gray-300 overflow-hidden">
+              <button
+                onClick={() => setMode('business')}
+                className={`px-4 py-2 text-sm font-semibold ${mode === 'business' ? 'bg-gray-900 text-white' : 'bg-white text-gray-700'}`}
+              >
+                Business
+              </button>
+              <button
+                onClick={() => setMode('public')}
+                className={`px-4 py-2 text-sm font-semibold border-l border-gray-300 ${mode === 'public' ? 'bg-gray-900 text-white' : 'bg-white text-gray-700'}`}
+              >
+                Public
+              </button>
+            </div>
+          </div>
+
           <p className="text-lg text-gray-600 mb-4 max-w-3xl mx-auto" style={{ fontFamily: 'Arial, sans-serif' }}>
-            This will generate what business focus events are occurring
+            {Subtitle}
           </p>
           <p className="text-lg text-gray-600 mb-8 max-w-3xl mx-auto" style={{ fontFamily: 'Arial, sans-serif' }}>
-            in our service area in the next 90 days.
+            {Subtitle2}
           </p>
-          
+
           <button
-            onClick={findOpportunities}
+            onClick={() => runSearch(mode)}
             disabled={isLoading}
             className="px-8 py-3 text-white font-semibold rounded-lg shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-            style={{ 
-              backgroundColor: '#00965E',
-              fontFamily: 'Arial, sans-serif'
-            }}
+            style={{ backgroundColor: '#00965E', fontFamily: 'Arial, sans-serif' }}
           >
             {isLoading ? (
               <div className="flex items-center">
@@ -177,7 +233,7 @@ export default function Home() {
             ) : (
               <div className="flex items-center">
                 <Search className="w-5 h-5 mr-2" />
-                Find Me Opportunities
+                {buttonText}
               </div>
             )}
           </button>
@@ -189,9 +245,8 @@ export default function Home() {
             Service Areas
           </h2>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
-            {serviceAreas.map((area, index) => (
-              <span key={index} className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm" 
-                    style={{ fontFamily: 'Arial, sans-serif' }}>
+            {serviceAreas.map((area, idx) => (
+              <span key={idx} className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm" style={{ fontFamily: 'Arial, sans-serif' }}>
                 {area}
               </span>
             ))}
@@ -200,16 +255,14 @@ export default function Home() {
 
         {/* Search Completion Message */}
         {searchTime && results && (
-          <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded mb-6" 
-               style={{ fontFamily: 'Arial, sans-serif' }}>
+          <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded mb-6" style={{ fontFamily: 'Arial, sans-serif' }}>
             Search completed in {searchTime.minutes > 0 ? `${searchTime.minutes} minute${searchTime.minutes > 1 ? 's' : ''} and ` : ''}{searchTime.seconds} second{searchTime.seconds !== 1 ? 's' : ''}
           </div>
         )}
 
         {/* Error Message */}
         {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded mb-6" 
-               style={{ fontFamily: 'Arial, sans-serif' }}>
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded mb-6" style={{ fontFamily: 'Arial, sans-serif' }}>
             {error}
           </div>
         )}
@@ -219,8 +272,7 @@ export default function Home() {
           <div className="space-y-8">
             {Object.entries(results).map(([state, events]) => (
               <div key={state}>
-                <h2 className="text-2xl font-bold text-gray-900 mb-6 pb-2 border-b-2 border-gray-300" 
-                    style={{ fontFamily: 'Arial, sans-serif' }}>
+                <h2 className="text-2xl font-bold text-gray-900 mb-6 pb-2 border-b-2 border-gray-300" style={{ fontFamily: 'Arial, sans-serif' }}>
                   {state} - {events.length} Opportunit{events.length === 1 ? 'y' : 'ies'} Found
                 </h2>
                 <div className="grid gap-6 md:grid-cols-2">
@@ -239,18 +291,35 @@ export default function Home() {
             <h2 className="text-xl font-semibold text-gray-900 mb-4" style={{ fontFamily: 'Arial, sans-serif' }}>
               Sample Result
             </h2>
-            <EventCard 
-              event={{
-                name: "2025 North Shore Business Expo",
-                date: "March 15, 2025",
-                location: "North Shore, Massachusetts",
-                cost: "$25 for exhibitors, Free for attendees",
-                audienceType: "Small and medium-sized business owners, entrepreneurs, and local professionals",
-                contactInfo: "info@northshorebusinessexpo.com",
-                link: "https://northshorebusinessexpo.com",
-                whyBBBShouldBeThere: "This is a prime networking opportunity to directly engage with local business leaders. BBB can offer a free seminar on 'Protecting Your Business from Scams & Fraud' or 'Unlocking the Power of Conflict Resolution in the Workplace,' directly aligning with BBB's mission. A booth presence allows for one-on-one conversations to recruit new accredited businesses and offer resources on ethical business practices."
-              }}
-            />
+            {mode === 'business' ? (
+              <EventCard
+                event={{
+                  name: "2025 North Shore Business Expo",
+                  date: "March 15, 2025",
+                  location: "North Shore, Massachusetts",
+                  cost: "$25 for exhibitors, Free for attendees",
+                  audienceType: "Small and medium-sized business owners, entrepreneurs, and local professionals",
+                  contactInfo: "info@northshorebusinessexpo.com",
+                  link: "https://northshorebusinessexpo.com",
+                  whyBBBShouldBeThere: "Prime networking to engage business leaders; host a BBB seminar on scam prevention."
+                }}
+              />
+            ) : (
+              <EventCard
+                event={{
+                  name: "City Spring Festival",
+                  date: "April 20, 2025",
+                  time: "10:00 AM – 3:00 PM",
+                  city: "Boston",
+                  state: "MA",
+                  cost: "Free",
+                  topic: "Community Festival/Fair",
+                  contactInfo: "events@boston.gov",
+                  link: "https://www.boston.gov/events",
+                  whyBBBShouldBeThere: "Large general audience for consumer education and scam-prevention outreach."
+                }}
+              />
+            )}
           </div>
         )}
       </div>
