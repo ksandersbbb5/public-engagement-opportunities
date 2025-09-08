@@ -51,8 +51,10 @@ export default function Home() {
         body: JSON.stringify({
           serviceAreas,
           bbbTopics,
-          timeframe: '90 days',
-          mode: which
+          timeframe: `${which === 'public' ? 120 : 90} days`,
+          mode: which,
+          days: which === 'public' ? 120 : 90,
+          allowUnknownDates: which === 'public' ? true : false
         }),
       });
 
@@ -269,11 +271,15 @@ export default function Home() {
                 <h2 className="text-2xl font-bold text-gray-900 mb-6 pb-2 border-b-2 border-gray-300" style={{ fontFamily: 'Arial, sans-serif' }}>
                   {state} - {events.length} Opportunit{events.length === 1 ? 'y' : 'ies'} Found
                 </h2>
-                <div className="grid gap-6 md:grid-cols-2">
-                  {events.map((event, index) => (
-                    <EventCard key={index} event={event} />
-                  ))}
-                </div>
+                {events.length === 0 ? (
+                  <div className="text-gray-600">No results. Try widening the window or switching modes.</div>
+                ) : (
+                  <div className="grid gap-6 md:grid-cols-2">
+                    {events.map((event, index) => (
+                      <EventCard key={index} event={event} />
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
           </div>
