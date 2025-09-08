@@ -8,15 +8,35 @@ function cors(res) {
 function emptyResult() {
   return { Massachusetts: [], Maine: [], "Rhode Island": [], Vermont: [] };
 }
-function parseUSDate(label) {
-  const d = new Date(label);
-  return isNaN(d.getTime()) ? null : d;
+function extractJson(text = '') {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end === -1) return '{}';
+  return text.slice(start, end + 1);
 }
-function withinNext90Days(date) {
+function sanitizeDateString(s) {
+  if (!s || typeof s !== 'string') return s;
+  return s
+    .replace(/(\d+)(st|nd|rd|th)/gi, '$1')
+    .replace(/\s?[-–]\s?\d{1,2}(?=,|\s|$)/, '');
+}
+function parseUSDate(label) {
+  const cleaned = sanitizeDateString(label);
+  const d = cleaned ? new Date(cleaned) : null;
+  return d && !isNaN(d.getTime()) ? d : null;
+}
+function withinNextDays(date, days) {
   const now = new Date();
-  const end = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
+  const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
   return date > now && date <= end;
 }
+const STATES = ['Massachusetts', 'Maine', 'Rhode Island', 'Vermont'];
+const TAXONOMY = [
+  "Consumer Education","Scam Prevention","Shredding/Identity Theft","Senior Outreach",
+  "Military/Veterans","Youth/Students","Community Festival/Fair","Parade/Civic","Job/Career",
+  "Housing/Home Improvement","Health/Wellness","Sustainability","Finance/Budgeting",
+  "Technology/Cyber","Other"
+];
 
 export default async function handler(req, res) {
   cors(res);
@@ -27,18 +47,12 @@ export default async function handler(req, res) {
     if (!process.env.OPENAI_API_KEY) throw new Error('OpenAI API key not found');
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+    const { days = 90, allowUnknownDates = false } = (req.body || {});
     const today = new Date().toLocaleDateString('en-US');
-    const futureDate = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US');
-
-    const taxonomy = [
-      "Consumer Education","Scam Prevention","Shredding/Identity Theft","Senior Outreach",
-      "Military/Veterans","Youth/Students","Community Festival/Fair","Parade/Civic","Job/Career",
-      "Housing/Home Improvement","Health/Wellness","Sustainability","Finance/Budgeting",
-      "Technology/Cyber","Other"
-    ];
+    const futureDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toLocaleDateString('en-US');
 
     const prompt = `You are a research assistant for the Better Business Bureau.
-TASK: Find 15–20 real PUBLIC/COMMUNITY events per state (Massachusetts, Maine, Rhode Island, Vermont) occurring in the next 90 days starting ${today} and before ${futureDate}.
+TASK: Find 6–12 real PUBLIC/COMMUNITY events per state (Massachusetts, Maine, Rhode Island, Vermont) occurring in the next ${days} days starting ${today} and before ${futureDate}.
 Event types: festivals, fairs, town days, parades, library/community programs, university public lectures, consumer shred days, scam-prevention talks, senior expos, farmers markets.
 
 Return ONLY strict JSON with this shape (no prose, no markdown fences):
@@ -67,7 +81,7 @@ Requirements:
 - Include only events dated AFTER ${today} and BEFORE ${futureDate}.
 - Prefer official sources (.gov, .edu, chambers, tourism boards, libraries, universities).
 - Do not invent events; if unsure, omit it.
-- "topic" MUST be one of: ${taxonomy.join(', ')}.
+- "topic" MUST be one of: ${TAXONOMY.join(', ')}.
 - Include contact email when listed on the page; otherwise leave null.`;
 
     const completion = await openai.chat.completions.create({
@@ -77,30 +91,24 @@ Requirements:
       messages: [{ role: 'user', content: prompt }],
     });
 
-    let results;
+    let results = emptyResult();
     try {
       const responseText = completion.choices[0]?.message?.content?.trim() || '{}';
-      const cleaned = responseText.replace(/```json?/g, '').replace(/```/g, '').trim();
-      const parsed = JSON.parse(cleaned);
+      const jsonCandidate = extractJson(responseText.replace(/```json?/g, '').replace(/```/g, '').trim());
+      const parsed = JSON.parse(jsonCandidate);
 
-      const states = ['Massachusetts', 'Maine', 'Rhode Island', 'Vermont'];
-      results = emptyResult();
-      let total = 0;
-
-      states.forEach((state) => {
+      STATES.forEach((state) => {
         const arr = Array.isArray(parsed[state]) ? parsed[state] : [];
         const filtered = arr.filter((e) => {
+          if (e?.topic && !TAXONOMY.includes(e.topic)) e.topic = "Other";
           const d = parseUSDate(e?.date);
-          return d && withinNext90Days(d);
+          if (d) return withinNextDays(d, days);
+          return allowUnknownDates === true;
         });
         results[state] = filtered;
-        total += filtered.length;
       });
-
-      if (total < 15) results = emptyResult();
     } catch (err) {
       console.log('Parse error; returning empty result:', err?.message);
-      results = emptyResult();
     }
 
     return res.status(200).json(results);
