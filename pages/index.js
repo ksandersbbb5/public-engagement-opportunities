@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import {
-  Search, Calendar, MapPin, Users, DollarSign, Phone, ExternalLink, Target, Tag, Clock
+  Search, Calendar, MapPin, Users, DollarSign, Phone, ExternalLink, Target, Tag, Clock, RefreshCcw, SlidersHorizontal
 } from 'lucide-react';
 
 export default function Home() {
@@ -9,20 +9,18 @@ export default function Home() {
   const [results, setResults] = useState(null);
   const [error, setError] = useState('');
   const [searchTime, setSearchTime] = useState(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Tunables (these are sent to the API)
+  const [days, setDays] = useState(150);
+  const [allowUnknownDates, setAllowUnknownDates] = useState(true);
+  const [targetPerState, setTargetPerState] = useState(12);
 
   const serviceAreas = [
-    'Vermont',
-    'Maine', 
-    'Rhode Island',
-    'Barnstable County, MA',
-    'Bristol County, MA',
-    'Dukes County, MA',
-    'Essex County, MA',
-    'Middlesex County, MA',
-    'Nantucket County, MA',
-    'Norfolk County, MA',
-    'Plymouth County, MA',
-    'Suffolk County, MA'
+    'Vermont','Maine','Rhode Island',
+    'Barnstable County, MA','Bristol County, MA','Dukes County, MA',
+    'Essex County, MA','Middlesex County, MA','Nantucket County, MA',
+    'Norfolk County, MA','Plymouth County, MA','Suffolk County, MA'
   ];
 
   const bbbTopics = [
@@ -35,7 +33,7 @@ export default function Home() {
     "Behind the Seal: Building Better Business -- Mastering Business Insurance"
   ];
 
-  async function runSearch(which = mode) {
+  async function runSearch(which = mode, overrides = {}) {
     const startTime = Date.now();
     setIsLoading(true);
     setError('');
@@ -44,21 +42,27 @@ export default function Home() {
 
     const endpoint = which === 'public' ? '/api/find-public-events' : '/api/find-opportunities';
 
+    const body = {
+      serviceAreas,
+      bbbTopics,
+      timeframe: `${overrides.days ?? days} days`,
+      mode: which,
+      days: overrides.days ?? days,
+      allowUnknownDates: overrides.allowUnknownDates ?? allowUnknownDates,
+      targetPerState: overrides.targetPerState ?? targetPerState,
+    };
+
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          serviceAreas,
-          bbbTopics,
-          timeframe: `${which === 'public' ? 120 : 90} days`,
-          mode: which,
-          days: which === 'public' ? 120 : 90,
-          allowUnknownDates: which === 'public' ? true : false
-        }),
+        body: JSON.stringify(body),
       });
 
-      if (!response.ok) throw new Error(`Failed to fetch ${which} opportunities`);
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`Failed to fetch ${which} opportunities (${response.status}) ${text}`);
+      }
 
       const data = await response.json();
       const elapsed = Math.round((Date.now() - startTime) / 1000);
@@ -72,10 +76,24 @@ export default function Home() {
     }
   }
 
+  function retryLooser() {
+    // Quick retry with looser constraints
+    const loosest = {
+      days: Math.max(180, days),
+      allowUnknownDates: true,
+      targetPerState: Math.max(15, targetPerState),
+    };
+    runSearch(mode, loosest);
+  }
+
+  const countsByState = results
+    ? Object.fromEntries(Object.entries(results).map(([k, v]) => [k, Array.isArray(v) ? v.length : 0]))
+    : null;
+
   const EventCard = ({ event }) => {
     const hasTopic = Boolean(event.topic);
-    const locationFallback = event.location ||
-      [event.city, event.state].filter(Boolean).join(', ') || 'Location TBD';
+    const locationFallback =
+      event.location || [event.city, event.state].filter(Boolean).join(', ') || 'Location TBD';
 
     return (
       <div className="bg-white border border-gray-200 rounded-lg p-6 shadow-sm hover:shadow-md transition-shadow">
@@ -170,7 +188,7 @@ export default function Home() {
     mode === 'public'
       ? 'This will generate public-facing events (festivals, fairs, town days, library programs, etc.)'
       : 'This will generate what business focus events are occurring';
-  const Subtitle2 = 'in our service area in the next 90 days.';
+  const Subtitle2 = `in our service area in the next ${days} days.`;
   const buttonText = mode === 'public' ? 'Find Public Opportunities' : 'Find Business Opportunities';
 
   return (
@@ -179,19 +197,12 @@ export default function Home() {
         {/* Header */}
         <div className="text-center mb-8">
           <div className="flex items-center justify-center mb-4">
-            <img
-              src="/images/bbb-logo.png"
-              alt="BBB Logo"
-              className="w-16 h-16 mr-4"
-              style={{ fontFamily: 'Arial, sans-serif' }}
-            />
-            <h1 className="text-4xl font-bold text-gray-900" style={{ fontFamily: 'Arial, sans-serif' }}>
-              {Title}
-            </h1>
+            <img src="/images/bbb-logo.png" alt="BBB Logo" className="w-16 h-16 mr-4" />
+            <h1 className="text-4xl font-bold text-gray-900">{Title}</h1>
           </div>
 
           {/* Mode toggle */}
-          <div className="flex justify-center mb-6">
+          <div className="flex justify-center mb-4">
             <div className="inline-flex rounded-lg border border-gray-300 overflow-hidden">
               <button
                 onClick={() => setMode('business')}
@@ -208,41 +219,100 @@ export default function Home() {
             </div>
           </div>
 
-          <p className="text-lg text-gray-600 mb-4 max-w-3xl mx-auto" style={{ fontFamily: 'Arial, sans-serif' }}>
-            {Subtitle}
-          </p>
-          <p className="text-lg text-gray-600 mb-8 max-w-3xl mx-auto" style={{ fontFamily: 'Arial, sans-serif' }}>
-            {Subtitle2}
-          </p>
+          {/* Advanced controls */}
+          <div className="flex items-center justify-center mb-6">
+            <button
+              onClick={() => setShowAdvanced((s) => !s)}
+              className="inline-flex items-center text-sm text-gray-700 hover:text-gray-900"
+            >
+              <SlidersHorizontal className="w-4 h-4 mr-2" />
+              {showAdvanced ? 'Hide' : 'Show'} Advanced
+            </button>
+          </div>
 
-          <button
-            onClick={() => runSearch(mode)}
-            disabled={isLoading}
-            className="px-8 py-3 text-white font-semibold rounded-lg shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-            style={{ backgroundColor: '#00965E', fontFamily: 'Arial, sans-serif' }}
-          >
-            {isLoading ? (
-              <div className="flex items-center">
-                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
-                Searching...
+          {showAdvanced && (
+            <div className="max-w-3xl mx-auto bg-white border border-gray-200 rounded-lg p-4 mb-4">
+              <div className="grid gap-4 md:grid-cols-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Days</label>
+                  <input
+                    type="number"
+                    min={30}
+                    max={365}
+                    value={days}
+                    onChange={(e) => setDays(Number(e.target.value))}
+                    className="w-full border border-gray-300 rounded px-2 py-1"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Target per state</label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={40}
+                    value={targetPerState}
+                    onChange={(e) => setTargetPerState(Number(e.target.value))}
+                    className="w-full border border-gray-300 rounded px-2 py-1"
+                  />
+                </div>
+                <div className="flex items-center mt-6">
+                  <input
+                    id="allowUnknownDates"
+                    type="checkbox"
+                    checked={allowUnknownDates}
+                    onChange={(e) => setAllowUnknownDates(e.target.checked)}
+                    className="mr-2"
+                  />
+                  <label htmlFor="allowUnknownDates" className="text-sm text-gray-700">
+                    Keep rows with unknown dates
+                  </label>
+                </div>
               </div>
-            ) : (
-              <div className="flex items-center">
-                <Search className="w-5 h-5 mr-2" />
-                {buttonText}
-              </div>
+            </div>
+          )}
+
+          <p className="text-lg text-gray-600 mb-2 max-w-3xl mx-auto">{Subtitle}</p>
+          <p className="text-lg text-gray-600 mb-6 max-w-3xl mx-auto">{Subtitle2}</p>
+
+          <div className="flex items-center justify-center gap-3">
+            <button
+              onClick={() => runSearch(mode)}
+              disabled={isLoading}
+              className="px-8 py-3 text-white font-semibold rounded-lg shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+              style={{ backgroundColor: '#00965E' }}
+            >
+              {isLoading ? (
+                <div className="flex items-center">
+                  <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
+                  Searching...
+                </div>
+              ) : (
+                <div className="flex items-center">
+                  <Search className="w-5 h-5 mr-2" />
+                  {buttonText}
+                </div>
+              )}
+            </button>
+
+            {results && (
+              <button
+                onClick={retryLooser}
+                className="px-4 py-3 text-gray-800 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 inline-flex items-center"
+                title="Retry with 180 days, allow TBD dates, target 15+ per state"
+              >
+                <RefreshCcw className="w-4 h-4 mr-2" />
+                Retry looser
+              </button>
             )}
-          </button>
+          </div>
         </div>
 
         {/* Service Areas Info */}
         <div className="bg-white rounded-lg p-6 mb-8 border border-gray-200">
-          <h2 className="text-xl font-semibold text-gray-900 mb-4" style={{ fontFamily: 'Arial, sans-serif' }}>
-            Service Areas
-          </h2>
+          <h2 className="text-xl font-semibold text-gray-900 mb-4">Service Areas</h2>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
             {serviceAreas.map((area, idx) => (
-              <span key={idx} className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm" style={{ fontFamily: 'Arial, sans-serif' }}>
+              <span key={idx} className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm">
                 {area}
               </span>
             ))}
@@ -251,32 +321,44 @@ export default function Home() {
 
         {/* Search Completion Message */}
         {searchTime && results && (
-          <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded mb-6" style={{ fontFamily: 'Arial, sans-serif' }}>
+          <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded mb-6">
             Search completed in {searchTime.minutes > 0 ? `${searchTime.minutes} minute${searchTime.minutes > 1 ? 's' : ''} and ` : ''}{searchTime.seconds} second{searchTime.seconds !== 1 ? 's' : ''}
           </div>
         )}
 
         {/* Error Message */}
         {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded mb-6" style={{ fontFamily: 'Arial, sans-serif' }}>
-            {error}
-          </div>
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded mb-6">{error}</div>
         )}
 
         {/* Results */}
         {results && (
           <div className="space-y-8">
+            {/* Quick counts header */}
+            <div className="bg-white border border-gray-200 rounded-lg p-4">
+              <h3 className="text-sm font-semibold text-gray-700 mb-2">Counts by state</h3>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(countsByState || {}).map(([state, count]) => (
+                  <span key={state} className="px-3 py-1 rounded-full text-sm border border-gray-300 bg-gray-50">
+                    {state}: <span className="font-semibold">{count}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+
             {Object.entries(results).map(([state, events]) => (
               <div key={state}>
-                <h2 className="text-2xl font-bold text-gray-900 mb-6 pb-2 border-b-2 border-gray-300" style={{ fontFamily: 'Arial, sans-serif' }}>
-                  {state} - {events.length} Opportunit{events.length === 1 ? 'y' : 'ies'} Found
+                <h2 className="text-2xl font-bold text-gray-900 mb-6 pb-2 border-b-2 border-gray-300">
+                  {state} - {Array.isArray(events) ? events.length : 0} Opportunit{Array.isArray(events) && events.length === 1 ? 'y' : 'ies'} Found
                 </h2>
-                {events.length === 0 ? (
-                  <div className="text-gray-600">No results. Try widening the window or switching modes.</div>
+                {!events || events.length === 0 ? (
+                  <div className="text-gray-600">
+                    No results for {state}. You can try <button className="underline text-blue-600" onClick={retryLooser}>Retry looser</button>.
+                  </div>
                 ) : (
                   <div className="grid gap-6 md:grid-cols-2">
                     {events.map((event, index) => (
-                      <EventCard key={index} event={event} />
+                      <EventCard key={`${state}-${index}`} event={event} />
                     ))}
                   </div>
                 )}
@@ -288,9 +370,7 @@ export default function Home() {
         {/* Sample Result (shown when no real results) */}
         {!results && !isLoading && (
           <div className="bg-white rounded-lg p-6 border border-gray-200">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4" style={{ fontFamily: 'Arial, sans-serif' }}>
-              Sample Result
-            </h2>
+            <h2 className="text-xl font-semibold text-gray-900 mb-4">Sample Result</h2>
             {mode === 'business' ? (
               <EventCard
                 event={{
