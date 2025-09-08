@@ -18,6 +18,12 @@ function extractJson(text = '') {
   if (start === -1 || end === -1) return '{}';
   return text.slice(start, end + 1);
 }
+function extractEventsArray(text = '') {
+  const m = text.match(/"events"\s*:\s*\[(?:[\s\S]*?)\]/);
+  if (!m) return '[]';
+  const arrStr = m[0].replace(/^[^{[]*"events"\s*:\s*/, '');
+  return arrStr;
+}
 
 function dedupeEvents(arr = []) {
   const seen = new Set();
@@ -34,47 +40,79 @@ function dedupeEvents(arr = []) {
   return out;
 }
 
-// --- Date parsing helpers (more forgiving) ---
+function credibilityScore(link = '') {
+  const u = String(link).toLowerCase();
+  if (!u) return 0;
+  if (u.includes('.gov') || u.includes('.edu')) return 3;
+  if (u.includes('chamber') || u.includes('tourism') || u.includes('visitor') || u.includes('cvb')) return 2;
+  if (u.includes('eventbrite') || u.includes('meetup')) return 1;
+  return 0;
+}
+
+// --- Date helpers (forgiving) ---
 function sanitizeDateString(s) {
   if (!s || typeof s !== 'string') return s;
   return s
-    .replace(/(\d+)(st|nd|rd|th)/gi, '$1')   // 1st → 1
+    .replace(/(\d+)(st|nd|rd|th)/gi, '$1')      // 1st → 1
     .replace(/\s?[-–]\s?\d{1,2}(?=,|\s|$)/, '') // Jan 5–7, 2025 → Jan 5, 2025
-    .replace(/\bSept\b/gi, 'Sep');           // Sept → Sep (Date likes "Sep")
+    .replace(/\bSept\b/gi, 'Sep');              // Sept → Sep
 }
-
 function ensureYear(s) {
   if (!s || typeof s !== 'string') return s;
-  if (/\b\d{4}\b/.test(s)) return s; // already has a year
-  const now = new Date();
-  const Y = now.getFullYear();
-  // Month name?
-  if (/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i.test(s)) {
-    return `${s}, ${Y}`;
-  }
-  // Numeric MM/DD (or MM-DD)
-  if (/^\s*\d{1,2}[\/-]\d{1,2}\s*$/.test(s)) {
-    return `${s}/${Y}`;
-  }
+  if (/\b\d{4}\b/.test(s)) return s;
+  const Y = new Date().getFullYear();
+  if (/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i.test(s)) return `${s}, ${Y}`;
+  if (/^\s*\d{1,2}[\/-]\d{1,2}\s*$/.test(s)) return `${s}/${Y}`;
   return s;
 }
-
 function parseUSDate(label) {
-  if (!label) return null;
   const s1 = sanitizeDateString(label);
   const s2 = ensureYear(s1);
-  const d = new Date(s2);
+  const d = s2 ? new Date(s2) : null;
   return d && !isNaN(d.getTime()) ? d : null;
 }
-
 function withinNextDays(date, days) {
   const now = new Date();
   const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
   return date > now && date <= end;
 }
 
+function filterRankLayered(arr, days, allowUnknownDates, target) {
+  const now = new Date();
+  const strict = [];
+  const future180 = [];
+  const tbd = [];
+  const credible = [];
+
+  for (const e of arr) {
+    const d = parseUSDate(e?.date);
+    if (d) {
+      if (withinNextDays(d, days)) strict.push(e);
+      else if (d > now && withinNextDays(d, 180)) future180.push(e); // up to +180d fallback
+    } else if (allowUnknownDates) {
+      tbd.push(e);
+    } else if (credibilityScore(e?.link) >= 2) {
+      credible.push(e);
+    }
+  }
+
+  // Sort by credibility within each bucket
+  const byScore = (a, b) => credibilityScore(b.link) - credibilityScore(a.link);
+  strict.sort(byScore);
+  future180.sort(byScore);
+  tbd.sort(byScore);
+  credible.sort(byScore);
+
+  // Layered combine
+  let out = [...strict];
+  if (out.length < target) out = [...out, ...future180];
+  if (out.length < target) out = [...out, ...tbd];
+  if (out.length < target) out = [...out, ...credible];
+
+  return dedupeEvents(out);
+}
+
 function coerceEventsShape(parsed, stateKey) {
-  // Accept several shapes the model might return
   if (Array.isArray(parsed?.events)) return parsed.events;
   if (Array.isArray(parsed?.data)) return parsed.data;
   if (Array.isArray(parsed?.[stateKey])) return parsed[stateKey];
@@ -105,13 +143,13 @@ Return ONLY strict JSON (no prose, no markdown). Shape:
 }
 
 TASK: List up to ${targetPerState} REAL business-focused events in ${state} occurring AFTER ${today} and BEFORE ${futureDate} (next ${days} days).
-Event types: chamber events, trade shows, business conferences, networking events, workshops.
+Types: chamber events, trade shows, business conferences, networking events, workshops.
 
-Rules:
+Guidelines:
 - Prefer official sources (.gov, chambers, associations, organizers).
 - If unsure an event is real, OMIT it.
-- Use "Free" or a $ value for cost if known; otherwise omit the field.
-- Use proper state code (MA, ME, RI, VT) for "state".
+- Use "Free" or a $ value for cost if known; otherwise omit.
+- Use proper state code (MA, ME, RI, VT).
 - If you cannot find ${targetPerState}, return as many as you can without inventing.`;
 }
 
@@ -125,26 +163,22 @@ export default async function handler(req, res) {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const {
-      days = 120,                 // widen window to improve recall
-      allowUnknownDates = false,  // UI can override; we also soft-fill below if empty
+      days = 150,                 // wider default
+      allowUnknownDates = true,   // default to keep TBD rows
       targetPerState = 12
     } = req.body || {};
 
     const today = new Date().toLocaleDateString('en-US');
     const futureDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toLocaleDateString('en-US');
 
-    // Build prompts per state
-    const prompts = STATES.map((state) =>
-      buildStatePrompt(state, today, futureDate, days, targetPerState)
-    );
+    const prompts = STATES.map((state) => buildStatePrompt(state, today, futureDate, days, targetPerState));
 
-    // Fire in parallel
     const calls = prompts.map((content) =>
       openai.chat.completions.create({
         model: 'gpt-4o-mini',
         temperature: 0.2,
         max_tokens: 4500,
-        response_format: { type: 'json_object' }, // enforce JSON when supported
+        response_format: { type: 'json_object' }, // if ignored, we still recover
         messages: [{ role: 'user', content }]
       })
     );
@@ -159,31 +193,27 @@ export default async function handler(req, res) {
         results[state] = [];
         return;
       }
-
       const content = resItem.value?.choices?.[0]?.message?.content?.trim() || '{}';
       let parsed;
       try {
         parsed = JSON.parse(content);
       } catch {
-        parsed = JSON.parse(extractJson(content)); // recover if JSON mode ignored
+        try {
+          parsed = JSON.parse(extractJson(content));
+        } catch {
+          // Last-ditch: try to extract the array only
+          try {
+            const arr = JSON.parse(extractEventsArray(content));
+            parsed = { events: arr };
+          } catch {
+            parsed = {};
+          }
+        }
       }
 
-      const arr = coerceEventsShape(parsed, state);
-
-      // Strict filter first (dates must parse & be within window)
-      let strict = arr.filter((e) => {
-        const d = parseUSDate(e?.date);
-        return d && withinNextDays(d, days);
-      });
-
-      // If strict came back light AND allowUnknownDates=false, softly add TBD-date rows
-      if (strict.length < Math.min(6, targetPerState) && allowUnknownDates === false) {
-        const tbd = arr.filter((e) => !parseUSDate(e?.date) && e?.name && e?.link);
-        // keep at most to targetPerState
-        strict = [...strict, ...tbd].slice(0, targetPerState);
-      }
-
-      results[state] = dedupeEvents(strict);
+      const raw = coerceEventsShape(parsed, state);
+      const filtered = filterRankLayered(raw, days, allowUnknownDates, targetPerState);
+      results[state] = filtered;
     });
 
     return res.status(200).json(results);
