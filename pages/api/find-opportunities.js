@@ -88,4 +88,63 @@ Rules:
 export default async function handler(req, res) {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.meth
+  if (req.method !== 'POST') return res.status(405).json({ message: 'Method not allowed' });
+
+  try {
+    if (!process.env.OPENAI_API_KEY) throw new Error('OpenAI API key not found');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    const {
+      days = 120,               // widen the window to improve recall
+      allowUnknownDates = false,
+      targetPerState = 10       // aim for ~10 per state
+    } = req.body || {};
+
+    const today = new Date().toLocaleDateString('en-US');
+    const futureDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toLocaleDateString('en-US');
+
+    // Fetch per state to reduce truncation/underfill
+    const results = emptyResult();
+
+    for (const state of STATES) {
+      const prompt = buildStatePrompt(state, today, futureDate, days, targetPerState);
+
+      let stateEvents = [];
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          temperature: 0.2,
+          max_tokens: 4500,
+          response_format: { type: 'json_object' }, // enforce JSON when supported
+          messages: [{ role: 'user', content: prompt }],
+        });
+
+        const content = completion.choices?.[0]?.message?.content?.trim() || '{}';
+        let parsed;
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          parsed = JSON.parse(extractJson(content)); // fallback
+        }
+
+        const arr = Array.isArray(parsed?.events) ? parsed.events : [];
+        const filtered = arr.filter((e) => {
+          const d = parseUSDate(e?.date);
+          if (d) return withinNextDays(d, days);
+          return allowUnknownDates === true;
+        });
+
+        stateEvents = dedupeEvents(filtered);
+      } catch (err) {
+        console.log(`State fetch error (${state}):`, err?.message);
+      }
+
+      results[state] = stateEvents;
+    }
+
+    return res.status(200).json(results);
+  } catch (error) {
+    console.error('API Error:', error);
+    return res.status(500).json({ message: 'Failed to fetch opportunities', error: error.message });
+  }
+}
