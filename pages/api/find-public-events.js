@@ -1,11 +1,13 @@
 import OpenAI from 'openai';
 
+// ---------- CORS ----------
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
+// ---------- CONSTANTS ----------
 const STATES = ['Massachusetts', 'Maine', 'Rhode Island', 'Vermont'];
 const TAXONOMY = [
   "Consumer Education","Scam Prevention","Shredding/Identity Theft","Senior Outreach",
@@ -14,10 +16,37 @@ const TAXONOMY = [
   "Technology/Cyber","Other"
 ];
 
+// City hints help the model “fan out” geographically per state
+const CITY_HINTS = {
+  Massachusetts: ["Boston","Cambridge","Worcester","Springfield","Lowell","Framingham","New Bedford","Quincy","Fall River","Brockton","Lynn","Plymouth","Newton","Somerville","Salem","Gloucester","Haverhill"],
+  Maine: ["Portland","Bangor","Lewiston","Augusta","Auburn","Biddeford","South Portland","Brunswick","Saco","Sanford"],
+  "Rhode Island": ["Providence","Warwick","Cranston","Pawtucket","Newport","East Providence","North Providence","Woonsocket"],
+  Vermont: ["Burlington","South Burlington","Rutland","Montpelier","Brattleboro","St. Albans","Bennington","Colchester","Essex"]
+};
+
+// Three “channels” per state to increase recall
+const CHANNELS = [
+  {
+    name: "Civic/Library/University",
+    focus: "library/community center programs, city/town civic events, university public lectures and workshops",
+    topicHint: "Consumer Education, Health/Wellness, Technology/Cyber, Finance/Budgeting, Youth/Students, Job/Career, Other"
+  },
+  {
+    name: "Festivals/Fairs/Parades/Markets",
+    focus: "festivals, fairs, town days, parades, farmers markets, seasonal community celebrations",
+    topicHint: "Community Festival/Fair, Parade/Civic, Other"
+  },
+  {
+    name: "Scam-Prevention/Shred/Senior",
+    focus: "scam-prevention talks, consumer shred/identity theft events, senior expos and outreach",
+    topicHint: "Scam Prevention, Shredding/Identity Theft, Senior Outreach, Consumer Education"
+  }
+];
+
+// ---------- UTIL ----------
 function emptyResult() {
   return { Massachusetts: [], Maine: [], "Rhode Island": [], Vermont: [] };
 }
-
 function extractJson(text = '') {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
@@ -27,10 +56,8 @@ function extractJson(text = '') {
 function extractEventsArray(text = '') {
   const m = text.match(/"events"\s*:\s*\[(?:[\s\S]*?)\]/);
   if (!m) return '[]';
-  const arrStr = m[0].replace(/^[^{[]*"events"\s*:\s*/, '');
-  return arrStr;
+  return m[0].replace(/^[^{[]*"events"\s*:\s*/, '');
 }
-
 function dedupeEvents(arr = []) {
   const seen = new Set();
   const out = [];
@@ -45,7 +72,6 @@ function dedupeEvents(arr = []) {
   }
   return out;
 }
-
 function credibilityScore(link = '') {
   const u = String(link).toLowerCase();
   if (!u) return 0;
@@ -54,8 +80,7 @@ function credibilityScore(link = '') {
   if (u.includes('eventbrite') || u.includes('meetup')) return 1;
   return 0;
 }
-
-// Date helpers
+// Date parsing (forgiving)
 function sanitizeDateString(s) {
   if (!s || typeof s !== 'string') return s;
   return s
@@ -82,11 +107,10 @@ function withinNextDays(date, days) {
   const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
   return date > now && date <= end;
 }
-
 function filterRankLayered(arr, days, allowUnknownDates, target) {
   const now = new Date();
   const strict = [];
-  const future180 = [];
+  const future240 = [];
   const tbd = [];
   const credible = [];
 
@@ -95,7 +119,7 @@ function filterRankLayered(arr, days, allowUnknownDates, target) {
     const d = parseUSDate(e?.date);
     if (d) {
       if (withinNextDays(d, days)) strict.push(e);
-      else if (d > now && withinNextDays(d, 180)) future180.push(e);
+      else if (d > now && withinNextDays(d, 240)) future240.push(e); // extend fallback horizon
     } else if (allowUnknownDates) {
       tbd.push(e);
     } else if (credibilityScore(e?.link) >= 2) {
@@ -105,19 +129,20 @@ function filterRankLayered(arr, days, allowUnknownDates, target) {
 
   const byScore = (a, b) => credibilityScore(b.link) - credibilityScore(a.link);
   strict.sort(byScore);
-  future180.sort(byScore);
+  future240.sort(byScore);
   tbd.sort(byScore);
   credible.sort(byScore);
 
-  let out = [...strict];
-  if (out.length < target) out = [...out, ...future180];
-  if (out.length < target) out = [...out, ...tbd];
-  if (out.length < target) out = [...out, ...credible];
-
-  return dedupeEvents(out);
+  let out = dedupeEvents([...strict]);
+  if (out.length < target) out = dedupeEvents([...out, ...future240]);
+  if (out.length < target) out = dedupeEvents([...out, ...tbd]);
+  if (out.length < target) out = dedupeEvents([...out, ...credible]);
+  return out.slice(0, Math.max(target, out.length)); // return all we got (no artificial cap)
 }
 
-function buildPublicPrompt(state, today, futureDate, days, targetPerState) {
+// ---------- PROMPTS ----------
+function buildChannelPrompt(state, channel, today, futureDate, days, perChannelTarget) {
+  const cities = CITY_HINTS[state]?.slice(0, 10).join(', ');
   return `You are assisting the Better Business Bureau.
 
 Return ONLY strict JSON (no prose, no markdown). Shape:
@@ -139,18 +164,35 @@ Return ONLY strict JSON (no prose, no markdown). Shape:
   ]
 }
 
-TASK: List up to ${targetPerState} REAL public/community events in ${state} occurring AFTER ${today} and BEFORE ${futureDate} (next ${days} days).
-Types: festivals, fairs, town days, parades, library/community programs, university public lectures, consumer shred days, scam-prevention talks, senior expos, farmers markets.
+STATE: ${state}
+HORIZON: AFTER ${today} and BEFORE ${futureDate} (next ${days} days)
+FOCUS: ${channel.name} — ${channel.focus}
+CITY HINTS (for coverage, optional): ${cities || 'n/a'}
 
-Guidelines:
+Rules:
 - Prefer official sources (.gov, .edu, libraries, universities, chambers, tourism boards, city sites).
-- If unsure an event is real, OMIT it.
-- "topic" MUST be from the list above; if uncertain, choose "Other".
-- Use "Free" or a $ value for cost if known; otherwise omit.
+- Events must be real; if unsure, omit it.
+- "topic" MUST be from the list above; if uncertain choose "Other".
 - Use proper state code (MA, ME, RI, VT).
-- If you cannot find ${targetPerState}, return as many as you can without inventing.`;
+- Return up to ${perChannelTarget} events for this channel.`;
 }
 
+function buildRefillPrompt(state, today, futureDate, days, excludeNames, want) {
+  return `You are assisting the Better Business Bureau.
+
+Return ONLY strict JSON:
+{ "events": [ /* same shape as above */ ] }
+
+STATE: ${state}
+HORIZON: AFTER ${today} and BEFORE ${futureDate} (next ${days} days)
+TASK: Find ${want} ADDITIONAL real public/community events NOT in this list (case-insensitive):
+${excludeNames.join(' | ')}
+
+Prioritize official sources (.gov, .edu, libraries, universities, chambers, tourism boards, city sites).
+Return as many as you can up to ${want}.`;
+}
+
+// ---------- HANDLER ----------
 export default async function handler(req, res) {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -161,58 +203,83 @@ export default async function handler(req, res) {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const {
-      days = 150,
-      allowUnknownDates = true,
-      targetPerState = 12
+      days = 180,               // wider default
+      allowUnknownDates = true, // keep TBD rows
+      targetPerState = 24       // aim higher
     } = req.body || {};
 
     const today = new Date().toLocaleDateString('en-US');
     const futureDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toLocaleDateString('en-US');
 
-    const prompts = STATES.map((state) => buildPublicPrompt(state, today, futureDate, days, targetPerState));
-
-    const calls = prompts.map((content) =>
-      openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        max_tokens: 4500,
-        response_format: { type: 'json_object' },
-        messages: [{ role: 'user', content }]
-      })
-    );
-
-    const settled = await Promise.allSettled(calls);
     const results = emptyResult();
 
-    settled.forEach((resItem, idx) => {
-      const state = STATES[idx];
-      if (resItem.status !== 'fulfilled') {
-        console.log(`Public fetch failed for ${state}:`, resItem.reason?.message);
-        results[state] = [];
-        return;
+    // For each state, run 3 channel prompts in parallel → merge → refill if light
+    await Promise.all(STATES.map(async (state) => {
+      const perChannelTarget = Math.max(8, Math.ceil(targetPerState / CHANNELS.length));
+
+      // Fire channel calls
+      const calls = CHANNELS.map((ch) =>
+        openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          temperature: 0.2,
+          max_tokens: 4500,
+          response_format: { type: 'json_object' },
+          messages: [{ role: 'user', content: buildChannelPrompt(state, ch, today, futureDate, days, perChannelTarget) }]
+        })
+      );
+
+      const settled = await Promise.allSettled(calls);
+      let merged = [];
+
+      for (const s of settled) {
+        if (s.status !== 'fulfilled') continue;
+        const content = s.value?.choices?.[0]?.message?.content?.trim() || '{}';
+        let parsed;
+        try { parsed = JSON.parse(content); }
+        catch {
+          try { parsed = JSON.parse(extractJson(content)); }
+          catch {
+            try { parsed = { events: JSON.parse(extractEventsArray(content)) }; }
+            catch { parsed = {}; }
+          }
+        }
+        const arr = Array.isArray(parsed?.events) ? parsed.events : [];
+        merged = merged.concat(arr);
       }
 
-      const content = resItem.value?.choices?.[0]?.message?.content?.trim() || '{}';
-      let parsed;
-      try {
-        parsed = JSON.parse(content);
-      } catch {
+      // Filter/Rank/Dedupe
+      let filtered = filterRankLayered(merged, days, allowUnknownDates, targetPerState);
+
+      // Refill pass if light
+      if (filtered.length < Math.floor(targetPerState * 0.8)) {
+        const excludeNames = filtered.map(e => (e?.name || '').slice(0, 80)).filter(Boolean);
         try {
-          parsed = JSON.parse(extractJson(content));
-        } catch {
-          try {
-            const arr = JSON.parse(extractEventsArray(content));
-            parsed = { events: arr };
-          } catch {
-            parsed = {};
+          const refill = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            temperature: 0.2,
+            max_tokens: 4500,
+            response_format: { type: 'json_object' },
+            messages: [{ role: 'user', content: buildRefillPrompt(state, today, futureDate, days, excludeNames, targetPerState) }]
+          });
+          const refillContent = refill.choices?.[0]?.message?.content?.trim() || '{}';
+          let refillParsed;
+          try { refillParsed = JSON.parse(refillContent); }
+          catch {
+            try { refillParsed = JSON.parse(extractJson(refillContent)); }
+            catch {
+              try { refillParsed = { events: JSON.parse(extractEventsArray(refillContent)) }; }
+              catch { refillParsed = {}; }
+            }
           }
+          const refillArr = Array.isArray(refillParsed?.events) ? refillParsed.events : [];
+          filtered = filterRankLayered([...filtered, ...refillArr], days, allowUnknownDates, targetPerState);
+        } catch (e) {
+          console.log(`Refill failed for ${state}:`, e?.message);
         }
       }
 
-      const raw = Array.isArray(parsed?.events) ? parsed.events : [];
-      const filtered = filterRankLayered(raw, days, allowUnknownDates, targetPerState);
-      results[state] = filtered;
-    });
+      results[state] = dedupeEvents(filtered);
+    }));
 
     return res.status(200).json(results);
   } catch (error) {
