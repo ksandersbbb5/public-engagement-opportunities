@@ -10,9 +10,22 @@ function cors(res) {
 // ---------- CONSTANTS ----------
 const STATES = ['Massachusetts', 'Maine', 'Rhode Island', 'Vermont'];
 
+// Service area restriction for Massachusetts
+const ALLOWED_MA_COUNTIES = [
+  'Barnstable', 'Bristol', 'Dukes', 'Essex', 'Middlesex',
+  'Nantucket', 'Norfolk', 'Plymouth', 'Suffolk'
+];
+
+// Common MA cities **outside** your service counties (backup guard if "county" missing)
+const EXCLUDED_MA_CITIES = new Set([
+  'Worcester','Springfield','Holyoke','Chicopee','Westfield','Pittsfield',
+  'Northampton','Greenfield','Amherst','Fitchburg','Leominster','Gardner',
+  'Southbridge','Athol','Clinton','Webster','Milford','Auburn','Shrewsbury'
+]);
+
 // City hints help the model “fan out” geographically per state
 const CITY_HINTS = {
-  Massachusetts: ["Boston","Cambridge","Worcester","Springfield","Lowell","Framingham","New Bedford","Quincy","Fall River","Brockton","Lynn","Plymouth","Newton","Somerville","Salem","Gloucester","Haverhill"],
+  Massachusetts: ["Boston","Cambridge","Somerville","Newton","Brookline","Quincy","Waltham","Lynn","Salem","Gloucester","Lowell","Lawrence","Haverhill","Medford","Malden","Framingham","Plymouth","Barnstable","New Bedford","Fall River"],
   Maine: ["Portland","Bangor","Lewiston","Augusta","Auburn","Biddeford","South Portland","Brunswick","Saco","Sanford"],
   "Rhode Island": ["Providence","Warwick","Cranston","Pawtucket","Newport","East Providence","North Providence","Woonsocket"],
   Vermont: ["Burlington","South Burlington","Rutland","Montpelier","Brattleboro","St. Albans","Bennington","Colchester","Essex"]
@@ -22,15 +35,15 @@ const CITY_HINTS = {
 const CHANNELS = [
   {
     name: "Chamber & Networking",
-    focus: "chamber of commerce mixers, networking breakfasts, business after-hours, member expos, young professionals",
+    focus: "chamber of commerce mixers, networking breakfasts, business after-hours, member expos, young professionals"
   },
   {
     name: "Conferences/Trade Shows/Expos",
-    focus: "industry conferences, trade shows, regional business expos, sector-specific showcases (manufacturing, construction, retail, hospitality, tech)",
+    focus: "industry conferences, trade shows, regional business expos, sector-specific showcases (manufacturing, construction, retail, hospitality, tech)"
   },
   {
     name: "Workshops/Training/Programs",
-    focus: "SBA/SBDC/SCORE workshops, university incubators/accelerators, economic development programs, procurement/government contracting",
+    focus: "SBA/SBDC/SCORE workshops, university incubators/accelerators, economic development programs, procurement/government contracting"
   }
 ];
 
@@ -38,17 +51,20 @@ const CHANNELS = [
 function emptyResult() {
   return { Massachusetts: [], Maine: [], "Rhode Island": [], Vermont: [] };
 }
+
 function extractJson(text = '') {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start === -1 || end === -1) return '{}';
   return text.slice(start, end + 1);
 }
+
 function extractEventsArray(text = '') {
   const m = text.match(/"events"\s*:\s*\[(?:[\s\S]*?)\]/);
   if (!m) return '[]';
   return m[0].replace(/^[^{[]*"events"\s*:\s*/, '');
 }
+
 function dedupeEvents(arr = []) {
   const seen = new Set();
   const out = [];
@@ -63,22 +79,47 @@ function dedupeEvents(arr = []) {
   }
   return out;
 }
+
 function credibilityScore(link = '') {
-  const u = String(link).toLowerCase();
+  const u = String(link || '').toLowerCase();
   if (!u) return 0;
-  if (u.includes('.gov') || u.includes('.edu')) return 3;
-  if (u.includes('sba.gov') || u.includes('score.org') || u.includes('sbdc') || u.includes('economic') || u.includes('development')) return 3;
-  if (u.includes('chamber') || u.includes('association') || u.includes('manufactur') || u.includes('technology') || u.includes('startup') || u.includes('accelerator') || u.includes('incubator')) return 2;
+  if (u.includes('.gov') || u.includes('.edu')) return 4;
+  if (u.includes('sba.gov') || u.includes('score.org') || u.includes('sbdc')) return 4;
+  if (u.includes('chamber') || u.includes('association') || u.includes('economic') || u.includes('development')) return 3;
   if (u.includes('eventbrite') || u.includes('meetup')) return 1;
-  return 0;
+  return 2; // neutral .org/.com
 }
-// Date parsing (forgiving)
+
+// Try to avoid 404-prone deep slugs by trimming overly deep, low-cred paths
+function stabilizeLink(u = '') {
+  try {
+    const raw = u.startsWith('http') ? u : `https://${u}`;
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname || '/';
+    const depth = path.split('/').filter(Boolean).length;
+    const score = credibilityScore(u);
+
+    // If path looks very deep and domain isn't highly credible, prefer a stable page
+    if (depth >= 4 && score < 3) {
+      if (path.includes('/events')) url.pathname = '/events';
+      else if (path.includes('/calendar')) url.pathname = '/calendar';
+      else url.pathname = '/';
+      url.search = '';
+    }
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
+// --- Date helpers (forgiving) ---
 function sanitizeDateString(s) {
   if (!s || typeof s !== 'string') return s;
   return s
-    .replace(/(\d+)(st|nd|rd|th)/gi, '$1')
-    .replace(/\s?[-–]\s?\d{1,2}(?=,|\s|$)/, '')
-    .replace(/\bSept\b/gi, 'Sep');
+    .replace(/(\d+)(st|nd|rd|th)/gi, '$1')      // 1st → 1
+    .replace(/\s?[-–]\s?\d{1,2}(?=,|\s|$)/, '') // Jan 5–7, 2025 → Jan 5, 2025
+    .replace(/\bSept\b/gi, 'Sep');              // Sept → Sep
 }
 function ensureYear(s) {
   if (!s || typeof s !== 'string') return s;
@@ -99,6 +140,31 @@ function withinNextDays(date, days) {
   const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
   return date > now && date <= end;
 }
+
+function isAllowedMACounty(countyText = '') {
+  const c = String(countyText || '').toLowerCase();
+  return ALLOWED_MA_COUNTIES.some(allowed => c.includes(allowed.toLowerCase()));
+}
+
+function isExcludedMACity(cityText = '') {
+  return EXCLUDED_MA_CITIES.has(String(cityText || '').trim());
+}
+
+function filterRegion(e) {
+  if ((e?.state || '').toUpperCase() !== 'MA' && (e?.state || '').toUpperCase() !== 'MASSACHUSETTS') {
+    return true; // only special filtering for Massachusetts
+  }
+  // If county provided, strictly enforce service area
+  if (e?.county && isAllowedMACounty(e.county)) return true;
+  if (e?.county && !isAllowedMACounty(e.county)) return false;
+
+  // Fallback: city guard if county missing
+  if (e?.city && isExcludedMACity(e.city)) return false;
+
+  // As a last resort (no county, city not blacklisted) allow it
+  return true;
+}
+
 function filterRankLayered(arr, days, allowUnknownDates, target) {
   const now = new Date();
   const strict = [];
@@ -106,15 +172,22 @@ function filterRankLayered(arr, days, allowUnknownDates, target) {
   const tbd = [];
   const credible = [];
 
-  for (const e of arr) {
-    const d = parseUSDate(e?.date);
+  for (const raw of arr) {
+    // Region enforcement (MA counties)
+    if (!filterRegion(raw)) continue;
+
+    // Link stabilization & credibility boost
+    if (raw.link) raw.link = stabilizeLink(raw.link);
+
+    const d = parseUSDate(raw?.date);
     if (d) {
-      if (withinNextDays(d, days)) strict.push(e);
-      else if (d > now && withinNextDays(d, 240)) future240.push(e); // extend fallback horizon
+      if (withinNextDays(d, days)) strict.push(raw);
+      else if (d > now && withinNextDays(d, 240)) future240.push(raw); // extend fallback horizon
     } else if (allowUnknownDates) {
-      tbd.push(e);
-    } else if (credibilityScore(e?.link) >= 2) {
-      credible.push(e);
+      tbd.push(raw);
+    } else if (credibilityScore(raw?.link) >= 3) {
+      // credible orgs even without clear date
+      credible.push(raw);
     }
   }
 
@@ -134,6 +207,10 @@ function filterRankLayered(arr, days, allowUnknownDates, target) {
 // ---------- PROMPTS ----------
 function buildChannelPrompt(state, channel, today, futureDate, days, perChannelTarget) {
   const cities = CITY_HINTS[state]?.slice(0, 10).join(', ');
+  const maCountyClause = state === 'Massachusetts'
+    ? `\nIMPORTANT: Only include events in these Massachusetts counties: ${ALLOWED_MA_COUNTIES.join(', ')}.\n- For Massachusetts events, you MUST include a "county" field with one of exactly those counties. If you cannot determine the county, OMIT the event.\n- Do NOT include Worcester County or any city that lies outside those counties.`
+    : '';
+
   return `You are assisting the Better Business Bureau.
 
 Return ONLY strict JSON (no prose, no markdown). Shape:
@@ -144,12 +221,13 @@ Return ONLY strict JSON (no prose, no markdown). Shape:
       "time": "optional, e.g. 2:00 PM – 5:00 PM",
       "city": "City",
       "state": "MA|ME|RI|VT",
+      ${state === 'Massachusetts' ? `"county": "One of: ${ALLOWED_MA_COUNTIES.join(', ')}",` : ''}
       "location": "Venue or address",
       "cost": "Free or $amount",
       "name": "Event Name",
       "audienceType": "Small business owners, professionals, contractors, retailers, manufacturers, start-ups, etc.",
       "contactInfo": "email@domain.com or null",
-      "link": "https://official-source",
+      "link": "https://official-listing-or-calendar-or-homepage",
       "whyBBBShouldBeThere": "Short reason"
     }
   ]
@@ -158,16 +236,20 @@ Return ONLY strict JSON (no prose, no markdown). Shape:
 STATE: ${state}
 HORIZON: AFTER ${today} and BEFORE ${futureDate} (next ${days} days)
 FOCUS: ${channel.name} — ${channel.focus}
-CITY HINTS (for coverage, optional): ${cities || 'n/a'}
+CITY HINTS (for coverage, optional): ${cities || 'n/a'}${maCountyClause}
 
-Rules:
-- Prefer official sources (.gov, chambers, associations, SBA/SBDC/SCORE, universities, economic development).
-- Events must be real; if unsure, omit it.
-- Use proper state code (MA, ME, RI, VT).
-- Return up to ${perChannelTarget} events for this channel.`;
+Link policy (to avoid 404s):
+- Provide the **official listing URL** if available.
+- If a specific permalink is uncertain, provide the organizer's **events calendar root** (e.g., "/events" or "/calendar") or the **homepage**. Do NOT fabricate deep slugs.
+- Prefer credible domains: .gov, .edu, chambers, associations, SBA/SBDC/SCORE, economic development, universities.
+
+Return up to ${perChannelTarget} events for this channel.`;
 }
 
 function buildRefillPrompt(state, today, futureDate, days, excludeNames, want) {
+  const maCountyClause = state === 'Massachusetts'
+    ? `\nIMPORTANT: Only include these MA counties: ${ALLOWED_MA_COUNTIES.join(', ')}. Include a "county" field.`
+    : '';
   return `You are assisting the Better Business Bureau.
 
 Return ONLY strict JSON:
@@ -176,9 +258,11 @@ Return ONLY strict JSON:
 STATE: ${state}
 HORIZON: AFTER ${today} and BEFORE ${futureDate} (next ${days} days)
 TASK: Find ${want} ADDITIONAL real business-focused events NOT in this list (case-insensitive):
-${excludeNames.join(' | ')}
+${excludeNames.join(' | ')}${maCountyClause}
 
-Prioritize official sources (.gov, chambers, associations, SBA/SBDC/SCORE, economic development, universities).
+Link policy:
+- Use official listing; otherwise the organizer's events calendar or homepage.
+- Prefer credible domains (.gov, .edu, chambers, associations, SBA/SBDC/SCORE, econ dev, universities).
 Return as many as you can up to ${want}.`;
 }
 
@@ -236,7 +320,7 @@ export default async function handler(req, res) {
         merged = merged.concat(arr);
       }
 
-      // Filter/Rank/Dedupe
+      // Filter/Rank/Dedupe + region & link stabilization
       let filtered = filterRankLayered(merged, days, allowUnknownDates, targetPerState);
 
       // Refill pass if light
