@@ -90,36 +90,13 @@ function credibilityScore(link = '') {
   return 2; // neutral .org/.com
 }
 
-// Try to avoid 404-prone deep slugs by trimming overly deep, low-cred paths
-function stabilizeLink(u = '') {
-  try {
-    const raw = u.startsWith('http') ? u : `https://${u}`;
-    const url = new URL(raw);
-    const host = url.hostname.toLowerCase();
-    const path = url.pathname || '/';
-    const depth = path.split('/').filter(Boolean).length;
-    const score = credibilityScore(u);
-
-    // If path looks very deep and domain isn't highly credible, prefer a stable page
-    if (depth >= 4 && score < 3) {
-      if (path.includes('/events')) url.pathname = '/events';
-      else if (path.includes('/calendar')) url.pathname = '/calendar';
-      else url.pathname = '/';
-      url.search = '';
-    }
-    return url.toString();
-  } catch {
-    return u;
-  }
-}
-
 // --- Date helpers (forgiving) ---
 function sanitizeDateString(s) {
   if (!s || typeof s !== 'string') return s;
   return s
-    .replace(/(\d+)(st|nd|rd|th)/gi, '$1')      // 1st → 1
-    .replace(/\s?[-–]\s?\d{1,2}(?=,|\s|$)/, '') // Jan 5–7, 2025 → Jan 5, 2025
-    .replace(/\bSept\b/gi, 'Sep');              // Sept → Sep
+    .replace(/(\d+)(st|nd|rd|th)/gi, '$1')
+    .replace(/\s?[-–]\s?\d{1,2}(?=,|\s|$)/, '')
+    .replace(/\bSept\b/gi, 'Sep');
 }
 function ensureYear(s) {
   if (!s || typeof s !== 'string') return s;
@@ -145,26 +122,87 @@ function isAllowedMACounty(countyText = '') {
   const c = String(countyText || '').toLowerCase();
   return ALLOWED_MA_COUNTIES.some(allowed => c.includes(allowed.toLowerCase()));
 }
-
 function isExcludedMACity(cityText = '') {
   return EXCLUDED_MA_CITIES.has(String(cityText || '').trim());
 }
-
 function filterRegion(e) {
-  if ((e?.state || '').toUpperCase() !== 'MA' && (e?.state || '').toUpperCase() !== 'MASSACHUSETTS') {
-    return true; // only special filtering for Massachusetts
-  }
-  // If county provided, strictly enforce service area
+  const st = String(e?.state || '').toUpperCase();
+  if (st !== 'MA' && st !== 'MASSACHUSETTS') return true; // special filtering only for MA
   if (e?.county && isAllowedMACounty(e.county)) return true;
   if (e?.county && !isAllowedMACounty(e.county)) return false;
-
-  // Fallback: city guard if county missing
   if (e?.city && isExcludedMACity(e.city)) return false;
-
-  // As a last resort (no county, city not blacklisted) allow it
   return true;
 }
 
+// ---------- LINK VALIDATION & REPAIR ----------
+function normalizeUrl(u = '') {
+  if (!u) return '';
+  try { return new URL(u).toString(); }
+  catch {
+    try { return new URL(`https://${u}`).toString(); }
+    catch { return ''; }
+  }
+}
+async function urlOk(url) {
+  if (!url) return false;
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 5000);
+  try {
+    // Try HEAD first
+    const r1 = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: controller.signal });
+    if (r1.ok) { clearTimeout(t); return true; }
+    // Some sites block HEAD → try GET (we're server-side)
+    const r2 = await fetch(url, { method: 'GET', redirect: 'follow', signal: controller.signal });
+    clearTimeout(t);
+    return r2.ok;
+  } catch {
+    clearTimeout(t);
+    return false;
+  }
+}
+function originOf(u) {
+  try { return new URL(u).origin; } catch { return ''; }
+}
+function stableCandidates(original) {
+  const norm = normalizeUrl(original);
+  const origin = originOf(norm);
+  const list = [];
+  if (norm) list.push(norm);
+  if (origin) {
+    list.push(`${origin}/events`, `${origin}/calendar`, `${origin}/event`, origin);
+  }
+  return Array.from(new Set(list));
+}
+function inferOriginFromEmail(info = '') {
+  const m = String(info).match(/@([a-z0-9.-]+\.[a-z]{2,})/i);
+  if (!m) return '';
+  return `https://${m[1].toLowerCase()}`;
+}
+function organizerFallbacks(name = '', link = '', contactInfo = '') {
+  const n = String(name).toLowerCase();
+  const l = String(link).toLowerCase();
+  const out = [];
+  if (n.includes('sba') || l.includes('sba')) out.push('https://www.sba.gov/events');
+  if (n.includes('score') || l.includes('score')) out.push('https://www.score.org/events');
+  if (n.includes('sbdc') || l.includes('sbdc')) out.push('https://americassbdc.org'); // stable hub
+  const orgFromEmail = inferOriginFromEmail(contactInfo);
+  if (orgFromEmail) out.push(`${orgFromEmail}/events`, `${orgFromEmail}/calendar`, orgFromEmail);
+  return out;
+}
+async function ensureWorkingLink(e) {
+  // prefer model link if it works, else try stable variants, else organizer fallbacks, else null
+  const firstBatch = stableCandidates(e.link);
+  for (const c of firstBatch) {
+    if (await urlOk(c)) return c;
+  }
+  const secondBatch = organizerFallbacks(e.name, e.link, e.contactInfo);
+  for (const c of secondBatch) {
+    if (await urlOk(c)) return c;
+  }
+  return null; // hide the link in UI if nothing verified
+}
+
+// ---------- FILTER/RANK ----------
 function filterRankLayered(arr, days, allowUnknownDates, target) {
   const now = new Date();
   const strict = [];
@@ -173,35 +211,27 @@ function filterRankLayered(arr, days, allowUnknownDates, target) {
   const credible = [];
 
   for (const raw of arr) {
-    // Region enforcement (MA counties)
     if (!filterRegion(raw)) continue;
-
-    // Link stabilization & credibility boost
-    if (raw.link) raw.link = stabilizeLink(raw.link);
 
     const d = parseUSDate(raw?.date);
     if (d) {
       if (withinNextDays(d, days)) strict.push(raw);
-      else if (d > now && withinNextDays(d, 240)) future240.push(raw); // extend fallback horizon
+      else if (d > now && withinNextDays(d, 240)) future240.push(raw);
     } else if (allowUnknownDates) {
       tbd.push(raw);
     } else if (credibilityScore(raw?.link) >= 3) {
-      // credible orgs even without clear date
       credible.push(raw);
     }
   }
 
   const byScore = (a, b) => credibilityScore(b.link) - credibilityScore(a.link);
-  strict.sort(byScore);
-  future240.sort(byScore);
-  tbd.sort(byScore);
-  credible.sort(byScore);
+  strict.sort(byScore); future240.sort(byScore); tbd.sort(byScore); credible.sort(byScore);
 
   let out = dedupeEvents([...strict]);
   if (out.length < target) out = dedupeEvents([...out, ...future240]);
   if (out.length < target) out = dedupeEvents([...out, ...tbd]);
   if (out.length < target) out = dedupeEvents([...out, ...credible]);
-  return out; // keep all we got
+  return out;
 }
 
 // ---------- PROMPTS ----------
@@ -238,9 +268,9 @@ HORIZON: AFTER ${today} and BEFORE ${futureDate} (next ${days} days)
 FOCUS: ${channel.name} — ${channel.focus}
 CITY HINTS (for coverage, optional): ${cities || 'n/a'}${maCountyClause}
 
-Link policy (to avoid 404s):
-- Provide the **official listing URL** if available.
-- If a specific permalink is uncertain, provide the organizer's **events calendar root** (e.g., "/events" or "/calendar") or the **homepage**. Do NOT fabricate deep slugs.
+Link policy (avoid 404s):
+- Provide the official listing URL if available.
+- If a specific permalink is uncertain, provide the organizer's **events calendar** ("/events" or "/calendar") or **homepage**. Do NOT fabricate deep slugs.
 - Prefer credible domains: .gov, .edu, chambers, associations, SBA/SBDC/SCORE, economic development, universities.
 
 Return up to ${perChannelTarget} events for this channel.`;
@@ -262,7 +292,7 @@ ${excludeNames.join(' | ')}${maCountyClause}
 
 Link policy:
 - Use official listing; otherwise the organizer's events calendar or homepage.
-- Prefer credible domains (.gov, .edu, chambers, associations, SBA/SBDC/SCORE, econ dev, universities).
+- Prefer credible domains (.gov, .edu, chambers, associations, SBA/SBDC/SCORE, economic development, universities).
 Return as many as you can up to ${want}.`;
 }
 
@@ -277,9 +307,9 @@ export default async function handler(req, res) {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const {
-      days = 180,               // wider default to improve recall
-      allowUnknownDates = true, // keep TBD rows
-      targetPerState = 24       // aim higher
+      days = 180,
+      allowUnknownDates = true,
+      targetPerState = 24
     } = req.body || {};
 
     const today = new Date().toLocaleDateString('en-US');
@@ -287,10 +317,10 @@ export default async function handler(req, res) {
 
     const results = emptyResult();
 
-    // For each state: 3 channel prompts in parallel → merge → refill if light
     await Promise.all(STATES.map(async (state) => {
       const perChannelTarget = Math.max(8, Math.ceil(targetPerState / CHANNELS.length));
 
+      // 3 channel calls in parallel
       const calls = CHANNELS.map((ch) =>
         openai.chat.completions.create({
           model: 'gpt-4o-mini',
@@ -320,10 +350,10 @@ export default async function handler(req, res) {
         merged = merged.concat(arr);
       }
 
-      // Filter/Rank/Dedupe + region & link stabilization
+      // Filter / rank / region guard
       let filtered = filterRankLayered(merged, days, allowUnknownDates, targetPerState);
 
-      // Refill pass if light
+      // Refill if light
       if (filtered.length < Math.floor(targetPerState * 0.8)) {
         const excludeNames = filtered.map(e => (e?.name || '').slice(0, 80)).filter(Boolean);
         try {
@@ -351,7 +381,15 @@ export default async function handler(req, res) {
         }
       }
 
-      results[state] = dedupeEvents(filtered);
+      // ---- Verify & repair links (async) ----
+      const repaired = await Promise.all(
+        filtered.map(async (e) => {
+          const fixed = await ensureWorkingLink(e);
+          return { ...e, link: fixed };
+        })
+      );
+
+      results[state] = dedupeEvents(repaired);
     }));
 
     return res.status(200).json(results);
